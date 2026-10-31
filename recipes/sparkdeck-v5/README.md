@@ -24,6 +24,44 @@ raise; the benchmarked configuration was run with the overlay without these guar
 
 Launch: [`serve.sh`](serve.sh) (`HF_HOME_HOST` defaults to `~/.cache/huggingface`; listens on :8000, model name `glm-5.3-flash`).
 
+## 300 W vs 450 W per GPU
+
+Same container, same benchmarks, 2026-10-31; only the enforced power limit changed.
+
+| | 300 W | 450 W | 300 W / 450 W |
+|---|---|---|---|
+| Decode C1, aggregate tok/s | 170.7 | 188.8 | 90% |
+| Decode C4, aggregate tok/s | 317.6 | 390.0 | 81% |
+| Decode C8, aggregate tok/s | 435.6 | 546.8 | 80% |
+| Prefill 1 × 64K, tok/s | 8,182 | 11,156 | 73% |
+| Prefill C1/C4/C8 × 8K, aggregate tok/s | 8,448 / 8,464 / 8,450 | 11,483 / 11,446 / 11,427 | 74% |
+
+Single-stream decode is mostly latency-bound and loses ~10% at 300 W; batched decode and prefill are
+compute-bound and lose 20–27%.
+
+## Speeds at 450 W per GPU
+
+Methodology identical to the 300 W section below. Raw outputs: [`results/450w-2026-10-31/`](results/450w-2026-10-31).
+A SparkDeck peer node sent two short probe requests (~16 generated tokens) during an earlier C4 attempt;
+that attempt was discarded and C4/C8 rerun with any round whose backend request count did not match
+re-executed (none needed). C1 completed before the probes.
+
+| Concurrency | Aggregate output tok/s (median) | Rounds | Per-request decode tok/s | Median TTFT | MTP accepted / step |
+|---|---|---|---|---|---|
+| C1 | **188.8** | 182.4 – 191.6 | 192.9 | 180 ms | 1.64 (54.5%) |
+| C4 | **390.0** | 374.5 – 396.9 | 102.4 | 442 ms | 1.61 (53.6%) |
+| C8 | **546.8** | 544.7 – 546.9 | 72.7 | 499 ms | 1.58 (52.6%) |
+
+| Prefill workload | TTFT | Prefill tok/s |
+|---|---|---|
+| 1 × 1K tokens | 0.155 s | 6,592 |
+| 1 × 4K tokens | 0.353 s | 11,605 |
+| 1 × 16K tokens | 1.442 s | 11,361 |
+| 1 × 64K tokens | 5.875 s | 11,156 |
+| C1 × 8K tokens | 0.713 s | **11,483** |
+| C4 × 8K tokens | 2.863 s (last) | **11,446** (aggregate) |
+| C8 × 8K tokens | 5.735 s (last) | **11,427** (aggregate) |
+
 ## Speeds at 300 W per GPU
 
 Measured 2026-10-31 with both GPUs at a 300 W enforced power limit, server otherwise idle
@@ -64,7 +102,7 @@ Raw outputs: [`results/300w-2026-10-31/`](results/300w-2026-10-31).
 ## Reproduce
 
 ```bash
-sudo nvidia-smi -i 0,1 -pl 300
+sudo nvidia-smi -i 0,1 -pl 300   # or 450
 ./serve.sh
 python3 bench/coding.py --base-url http://127.0.0.1:8000 --model glm-5.3-flash --metrics-port 8000 --concurrency 1 --rounds 5 --output out/decode-c1
 python3 bench/coding.py --base-url http://127.0.0.1:8000 --model glm-5.3-flash --metrics-port 8000 --concurrency 4 8 --rounds 3 --output out/decode-c4c8

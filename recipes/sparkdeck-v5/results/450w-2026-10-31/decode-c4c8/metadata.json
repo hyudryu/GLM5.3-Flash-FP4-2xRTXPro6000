@@ -1,0 +1,20 @@
+{
+  "gpu_count": 2,
+  "concurrency": [
+    4,
+    8
+  ],
+  "rounds": 3,
+  "max_output_tokens": 1536,
+  "natural_eos": true,
+  "temperature": 0.0,
+  "top_p": null,
+  "thinking": "template default (always on, reasoning_effort max)",
+  "base_url": "http://127.0.0.1:8000",
+  "model": "glm-5.3-flash",
+  "cache_salt": "d87484b07984c5817f3b8dc0beea2ae66fffa1cce809f352fbf8085523c27431",
+  "power_limits": "index, power.limit [W], enforced.power.limit [W]\n0, 450.00 W, 450.00 W\n1, 450.00 W, 450.00 W\n",
+  "started_unix": 1793467450.4626827,
+  "aggregate_definition": "Sum of completion tokens / simultaneous-batch wall time, including prompt processing and client/transport overhead; gateway overhead applies only when the base URL is a gateway.",
+  "workload": "Python/TypeScript/Rust/Go implementation and tests; same prompts across power settings, unique per-request cache salt; cache hits must be zero."
+}
