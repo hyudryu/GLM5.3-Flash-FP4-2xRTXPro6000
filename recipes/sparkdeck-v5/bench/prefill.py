@@ -30,8 +30,9 @@ def make_ids(base, n, seed):
     return ids[:n]
 
 
-def one(base, ids, salt):
-    t0 = time.perf_counter(); ttft = None; usage = None
+def one(base, ids, salt, t0=None):
+    """TTFT in seconds, measured from t0 (a common batch start) when given, else from this request's start."""
+    t0 = time.perf_counter() if t0 is None else t0; ttft = None; usage = None
     body = {'model': MODEL, 'prompt': ids, 'max_tokens': 1, 'temperature': 0, 'stream': True,
             'stream_options': {'include_usage': True}, 'cache_salt': salt}
     with post(base, '/v1/completions', body, stream=True) as r:
@@ -74,9 +75,11 @@ def main():
         n = a.concurrent_length; walls = []
         for rep in range(a.reps):
             ids = [make_ids(a.base_url, n, f'c{c}-{rep}-{i}') for i in range(c)]
-            t0 = time.perf_counter()
             with cf.ThreadPoolExecutor(c) as ex:
-                ttfts = list(ex.map(lambda x: one(a.base_url, x[1], f'{tag}-c{c}-{rep}-{x[0]}'), enumerate(ids)))
+                # All TTFTs are measured from one batch start, so thread start/scheduling delays count
+                # toward the batch wall time (last first-token arrival - batch start).
+                t0 = time.perf_counter()
+                ttfts = list(ex.map(lambda x: one(a.base_url, x[1], f'{tag}-c{c}-{rep}-{x[0]}', t0), enumerate(ids)))
             walls.append(max(ttfts)); sent += c
         row = {'mode': f'C{c}', 'prompt_tokens': n, 'last_ttft_s': walls, 'aggregate_prefill_tps': c * n / statistics.median(walls)}
         rows.append(row); print(json.dumps(row), flush=True)

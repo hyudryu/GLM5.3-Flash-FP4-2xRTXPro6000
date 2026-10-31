@@ -17,6 +17,11 @@ running container (SparkDeck deployment *GLM-5.3-Flash-FP4 TP2 (b12x inline-CSF 
 | Overlay | 7 b12x source files in [`overlay/`](overlay) (inline compressed-scale-factor decode in the W4A16 MoE kernel, fused CSF expansion + pack, FC2 prefetch) |
 | Host | Linux 7.0, NVIDIA driver 595.99.02, **`iommu=pt` required** for GPU P2P (TP2 hangs at NCCL init otherwise) |
 
+The overlay here carries two fallback guards added after the benchmark run (from PR review): preparation
+uses the same inline-CSF format/geometry check as runtime dispatch, and the fused CSF route packer is
+skipped above its 1024-route limit. Both only change behaviour on paths that would otherwise mis-compile or
+raise; the benchmarked configuration was run with the overlay without these guards.
+
 Launch: [`serve.sh`](serve.sh) (`HF_HOME_HOST` defaults to `~/.cache/huggingface`; listens on :8000, model name `glm-5.3-flash`).
 
 ## Speeds at 300 W per GPU

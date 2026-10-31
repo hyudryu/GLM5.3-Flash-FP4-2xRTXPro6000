@@ -13352,6 +13352,7 @@ def _pack_routes_maybe_fused_with_csf(topk_ids, block_size, num_experts, csf_dec
     that pair on the deferred expansion's own route tensor (no expert map), the persistent CSF
     kernel's last CTA performs the packing; otherwise the recorded launches run as prepared.
     """
+    from b12x._lib.quant import csf_fast as _csf_fast
     from b12x._lib.quant import nvfp4_csf as csf
     from b12x.moe._shared.kernels.w4a16 import route_pack as rp
 
@@ -13378,6 +13379,9 @@ def _pack_routes_maybe_fused_with_csf(topk_ids, block_size, num_experts, csf_dec
         and topk_ids.dtype == torch.int32
         and topk_ids.data_ptr() == pending_ids.data_ptr()
         and topk_ids.numel() == pending_ids.numel()
+        # The fused packer (csf_fast.launch_fast_pair) holds route ranks in a fixed smem
+        # buffer; larger batches replay the recorded Triton pack + unfused expansion.
+        and topk_ids.numel() <= _csf_fast.MAX_PACK_ROUTES
         and not records[0][3][-1]  # COUNTS_ALIAS_PACKED
     )
     csf.log_once(f"pack: fusable={fusable} records={[r[0] for r in records]} dtypes={pending_ids.dtype}/{topk_ids.dtype} "

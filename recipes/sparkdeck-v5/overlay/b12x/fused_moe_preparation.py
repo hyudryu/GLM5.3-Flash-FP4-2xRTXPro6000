@@ -224,14 +224,21 @@ def _query(
         )
     # In-kernel CSF scale decode is a per-layer property: only layers with compressed
     # planes get kernels that read them (B12X_W4A16_CSF_INLINE=1).
+    # Use the same format/geometry check as runtime dispatch (b12x_moe_fp4), so a layer that
+    # falls back to scale expansion never gets a kernel compiled for compressed storage.
     from b12x.moe._shared.kernels.w4a16.kernel import _csf_inline_enabled
+    from ._impl import _csf_inline_supported
 
+    csf_decoder = getattr(experts._impl, "nvfp4_csf", None)
     controls = FrozenMapping(
         {
             **dict(controls.to_dict()),
             "csf_inline": bool(
                 _csf_inline_enabled()
-                and getattr(experts._impl, "nvfp4_csf", None) is not None
+                and csf_decoder is not None
+                and _csf_inline_supported(
+                    csf_decoder, experts.hidden_size, experts.intermediate_size
+                )
             ),
         }
     )
