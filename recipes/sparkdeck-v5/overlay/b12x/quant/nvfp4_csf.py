@@ -1,0 +1,968 @@
+"""Routed lossless NVFP4 scale expansion into native F8_128x4 storage.
+
+One grid expands gate/up and down scales. Each CTA owns a 128-row output
+region, writes its fixed stream, and applies its prepartitioned exceptions
+after a barrier. Output scratch is caller-owned and may be shared only by
+serialized layer execution on one CUDA stream.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import os
+import torch
+from cutlass.cutlass_dsl import Int32, Int64, Uint32, Uint64
+
+from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.program_cache import program_cache, register_program_cache
+from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
+from b12x._lib.utils import current_cuda_stream, make_ptr
+
+_LAUNCH_PROGRAMS = {}
+register_program_cache(_LAUNCH_PROGRAMS)
+
+
+@dataclass(frozen=True)
+class Nvfp4CsfBatch:
+    fixed: torch.Tensor
+    exceptions: torch.Tensor
+    task_offsets: torch.Tensor
+    rows: int
+    columns: int
+    codec: int = 0
+    layout: int = 0
+    value_lut: torch.Tensor | None = None
+    # Planes whose rows are not a multiple of 128 or whose k-groups are not a
+    # multiple of four are stored padded to the native F8_128x4 scale grid
+    # (rows/columns above); these hold their unpadded geometry.
+    logical_rows: int | None = None
+    logical_columns: int | None = None
+
+    @property
+    def num_experts(self):
+        return int(self.fixed.shape[0])
+
+    @property
+    def geometry(self):
+        return self.rows, self.columns, self.codec, self.layout
+
+    def validate(self):
+        alignment = 4 if self.codec == 0 else 8
+        if (
+            self.rows <= 0
+            or self.rows % 128
+            or self.columns <= 0
+            or self.columns % alignment
+        ):
+            raise ValueError("NVFP4-CSF requires 128-row and codec-column alignment")
+        if self.rows * self.columns > (1 << (19 if self.codec == 2 else 24)):
+            raise ValueError("NVFP4-CSF position field is too small for the matrix")
+        if self.codec not in (0, 1, 2):
+            raise ValueError("Unknown NVFP4-CSF scale codec")
+        if self.layout not in (0, 1) or (self.layout and self.codec):
+            raise ValueError("MMA-packed NVFP4-CSF requires the byte-window codec")
+        if self.layout and (
+            self.value_lut is None
+            or self.value_lut.dtype != torch.uint8
+            or self.value_lut.shape != (256,)
+            or self.value_lut.device != self.fixed.device
+            or not self.value_lut.is_contiguous()
+        ):
+            raise ValueError(
+                "MMA-packed NVFP4-CSF requires a resident 256-byte conversion table"
+            )
+        slab = 128 if self.codec == 0 else 16
+        expected = (self.num_experts, self.rows // slab, slab * (1 + self.columns // 2))
+        if self.fixed.dtype != torch.uint8 or tuple(self.fixed.shape) != expected:
+            raise ValueError("NVFP4-CSF fixed stream geometry or dtype mismatch")
+        width = 3 if self.codec == 2 else 4
+        if (
+            self.exceptions.dtype != torch.uint8
+            or self.exceptions.ndim != 1
+            or self.exceptions.numel() % width
+        ):
+            raise ValueError("NVFP4-CSF exception stream extent or dtype mismatch")
+        if self.task_offsets.dtype != torch.int64 or tuple(self.task_offsets.shape) != (
+            self.num_experts,
+            self.rows // 128 + 1,
+        ):
+            raise ValueError(
+                "NVFP4-CSF requires expert-major 128-row exception partitions"
+            )
+        tensors = (self.fixed, self.exceptions, self.task_offsets)
+        if self.fixed.device.type != "cuda" or any(
+            t.device != self.fixed.device or not t.is_contiguous() for t in tensors
+        ):
+            raise ValueError(
+                "NVFP4-CSF runtime tensors must be contiguous on one CUDA device"
+            )
+
+
+def make_nvfp4_csf_batch(
+    fixed_planes,
+    exception_planes,
+    *,
+    rows,
+    columns,
+    device,
+    codec=0,
+    layout=0,
+    row_rotation=0,
+    value_lut=None,
+):
+    """Upload checkpoint planes and convert their compressed layout on CUDA."""
+    from ._nvfp4_csf_prepare import upload_and_convert
+
+    return upload_and_convert(
+        fixed_planes,
+        exception_planes,
+        rows=rows,
+        columns=columns,
+        device=device,
+        codec=codec,
+        layout=layout,
+        row_rotation=row_rotation,
+        value_lut=value_lut,
+    )
+
+
+def repack_nvfp4_csf_batch(batch, *, row_rotation, value_lut):
+    """Permute resident compressed slabs for W4A16 entirely on CUDA."""
+    from ._nvfp4_csf_prepare import convert_nvfp4_csf_storage
+
+    if batch.codec or batch.layout:
+        raise ValueError("MMA repacking requires native byte-window slabs")
+    batch.validate()
+    e, r, c = batch.num_experts, batch.rows, batch.columns
+    native = batch.fixed
+    bases = (
+        native[:, :, :128]
+        .reshape(e, r // 128, 32, 4)
+        .transpose(2, 3)
+        .reshape(e, r // 16, 16)
+    )
+    packed = native[:, :, 128:].reshape(e, r // 128, c // 4, 32, 4, 2)
+    packed = packed.permute(0, 1, 4, 3, 2, 5).reshape(e, r // 16, -1)
+    fixed = torch.cat((bases, packed), dim=2)
+    starts = torch.cat((batch.task_offsets[:, 0], batch.task_offsets[-1:, -1]))
+    return convert_nvfp4_csf_storage(
+        fixed,
+        batch.exceptions,
+        starts,
+        rows=r,
+        columns=c,
+        row_range=(0, batch.logical_rows or r),
+        column_range=(0, batch.logical_columns or c),
+        layout=1,
+        row_rotation=row_rotation,
+        value_lut=value_lut,
+    )
+
+
+class _Plane:
+    def __init__(self, geometry):
+        self.rows, self.columns, self.codec, self.layout = map(int, geometry)
+        self.tasks = self.rows // 128
+        self.tile_bytes = 16 * (1 + self.columns // 2)
+
+    @cute.jit
+    def tensors(
+        self, fixed, exceptions, offsets, output, lut, experts, exception_bytes
+    ):
+        return (
+            cute.make_tensor(
+                fixed,
+                cute.make_layout(
+                    (Int64(experts) * Int64(self.rows // 16 * self.tile_bytes),)
+                ),
+            ),
+            cute.make_tensor(exceptions, cute.make_layout((exception_bytes,))),
+            cute.make_tensor(
+                offsets, cute.make_layout((Int64(experts) * Int64(self.tasks + 1),))
+            ),
+            cute.make_tensor(
+                output,
+                cute.make_layout((Int64(experts) * Int64(self.rows * self.columns),)),
+            ),
+            cute.make_tensor(lut, cute.make_layout((256,))),
+        )
+
+    @cute.jit
+    def output_offset(self, row, column):
+        if cutlass.const_expr(self.layout == 1):
+            within = (row % Int32(8)) * Int32(8) + (row % Int32(64)) // Int32(8)
+            within = (
+                (within & Int32(-4))
+                | ((within & Int32(1)) << Int32(1))
+                | ((within & Int32(2)) >> Int32(1))
+            )
+            return column * Int32(self.rows) + row // Int32(64) * Int32(64) + within
+        return (
+            (
+                ((row // Int32(128)) * Int32(self.columns // 4) + column // Int32(4))
+                * Int32(32)
+                + row % Int32(32)
+            )
+            * Int32(16)
+            + ((row % Int32(128)) // Int32(32)) * Int32(4)
+            + column % Int32(4)
+        )
+
+    @cute.jit
+    def decode(self, tensors, expert, task, tid):
+        fixed, exceptions, offsets, output, lut = tensors
+        fixed16 = cute.recast_tensor(fixed, cutlass.Uint16)
+        output32 = cute.recast_tensor(output, cutlass.Uint32)
+        if cutlass.const_expr(self.layout == 1):
+            tile = (Int64(expert) * Int64(self.tasks) + Int64(task)) * Int64(
+                128 * (1 + self.columns // 2)
+            )
+            fixed32 = cute.recast_tensor(fixed, cutlass.Uint32)
+            fixed64 = cute.recast_tensor(fixed, cutlass.Uint64)
+            output64 = cute.recast_tensor(output, cutlass.Uint64)
+            bases64 = fixed64[(tile >> Int64(3)) + Int64(tid % Int32(16))]
+            pair = tid
+            while pair < Int32(128 * self.columns // 8):
+                spread = fixed32[((tile + Int64(128)) >> Int64(2)) + Int64(pair)].to(
+                    Uint64
+                )
+                spread = (spread | (spread << Uint64(16))) & Uint64(0x0000FFFF0000FFFF)
+                spread = (spread | (spread << Uint64(8))) & Uint64(0x00FF00FF00FF00FF)
+                spread = (spread | (spread << Uint64(4))) & Uint64(0x0F0F0F0F0F0F0F0F)
+                source = spread + bases64
+                converted = Uint64(0)
+                for lane in cutlass.range_constexpr(8):
+                    byte = (source >> Uint64(8 * lane)) & Uint64(255)
+                    converted |= lut[Int64(byte)].to(Uint64) << Uint64(8 * lane)
+                destination = (
+                    Int64(expert) * Int64(self.rows * self.columns)
+                    + Int64(pair // Int32(16)) * Int64(self.rows)
+                    + Int64(task * 128 + (pair % Int32(16)) * 8)
+                )
+                output64[destination >> Int64(3)] = converted
+                pair += Int32(256)
+        elif cutlass.const_expr(self.codec == 0):
+            tile = (Int64(expert) * Int64(self.tasks) + Int64(task)) * Int64(
+                128 * (1 + self.columns // 2)
+            )
+            fixed32 = cute.recast_tensor(fixed, cutlass.Uint32)
+            output64 = cute.recast_tensor(output, cutlass.Uint64)
+            # Each thread writes two consecutive words. Their row bases repeat
+            # every 128 output words, independent of the column-group iteration.
+            bases = fixed16[(tile + Int64((tid * 2) % 128)) >> Int64(1)].to(Uint32)
+            base0 = (bases & Uint32(255)) * Uint32(0x01010101)
+            base1 = (bases >> Uint32(8)) * Uint32(0x01010101)
+            output_start = (
+                Int64(expert) * Int64(self.rows) + Int64(task) * Int64(128)
+            ) * Int64(self.columns // 4)
+            pair = tid
+            while pair < Int32(128 * self.columns // 8):
+                packed = fixed32[((tile + Int64(128)) >> Int64(2)) + Int64(pair)]
+                low, high = packed & Uint32(65535), packed >> Uint32(16)
+                low = (low | (low << Uint32(8))) & Uint32(0x00FF00FF)
+                high = (high | (high << Uint32(8))) & Uint32(0x00FF00FF)
+                low = (low | (low << Uint32(4))) & Uint32(0x0F0F0F0F)
+                high = (high | (high << Uint32(4))) & Uint32(0x0F0F0F0F)
+                value64 = (low + base0).to(Uint64) | (
+                    (high + base1).to(Uint64) << Uint64(32)
+                )
+                output64[(output_start >> Int64(1)) + Int64(pair)] = value64
+                pair += Int32(256)
+        else:
+            local = tid % Int32(128)
+            row = task * Int32(128) + (local % Int32(4)) * Int32(32) + local // Int32(4)
+            tile = (
+                Int64(expert) * Int64(self.rows // 16) + Int64(row // Int32(16))
+            ) * Int64(self.tile_bytes)
+            rr = row % Int32(16)
+            base = fixed[tile + Int64(rr)].to(Uint32)
+            output_start = (
+                Int64(expert) * Int64(self.rows) + Int64(task * 128)
+            ) * Int64(self.columns // 4)
+            word = tid
+            while word < Int32(128 * self.columns // 4):
+                column = (word // Int32(128)) * Int32(4)
+                values = Uint32(0)
+                if cutlass.const_expr(self.codec == 0):
+                    address = tile + Int64(
+                        16 + rr * Int32(self.columns // 2) + column // Int32(2)
+                    )
+                    packed = fixed16[address >> Int64(1)].to(Uint32)
+                    # Spread four nibbles to bytes before adding the row base.
+                    # base <= 240 prevents carries between the four byte lanes.
+                    values = (packed | (packed << Uint32(8))) & Uint32(0x00FF00FF)
+                    values = (values | (values << Uint32(4))) & Uint32(0x0F0F0F0F)
+                    values += base * Uint32(0x01010101)
+                else:
+                    selector = fixed[
+                        tile
+                        + Int64(16 + rr * Int32(self.columns // 8) + column // Int32(8))
+                    ].to(Uint32)
+                    mantissa_address = tile + Int64(
+                        16
+                        + 16 * (self.columns // 8)
+                        + rr * Int32(3 * self.columns // 8)
+                        + (column // Int32(8)) * Int32(3)
+                    )
+                    mantissa = (
+                        fixed[mantissa_address].to(Uint32)
+                        | (fixed[mantissa_address + Int64(1)].to(Uint32) << Uint32(8))
+                        | (fixed[mantissa_address + Int64(2)].to(Uint32) << Uint32(16))
+                    )
+                    for lane in cutlass.range_constexpr(4):
+                        cc = Uint32(column % Int32(8) + Int32(lane))
+                        high = base + ((selector >> cc) & Uint32(1))
+                        value = (high << Uint32(3)) | (
+                            (mantissa >> (cc * Uint32(3))) & Uint32(7)
+                        )
+                        values |= value << Uint32(8 * lane)
+                output32[output_start + Int64(word)] = values
+                word += Int32(256)
+        cute.arch.sync_threads()
+        partition = Int64(expert) * Int64(self.tasks + 1) + Int64(task)
+        entry = offsets[partition] + Int64(tid)
+        end = offsets[partition + Int64(1)]
+        while entry < end:
+            if cutlass.const_expr(self.codec == 2):
+                exception_address = entry * Int64(3)
+                exception_packed = (
+                    exceptions[exception_address].to(Uint32)
+                    | (exceptions[exception_address + Int64(1)].to(Uint32) << Uint32(8))
+                    | (
+                        exceptions[exception_address + Int64(2)].to(Uint32)
+                        << Uint32(16)
+                    )
+                )
+                position = exception_packed & Uint32((1 << 19) - 1)
+                exception_value = exception_packed >> Uint32(19)
+            else:
+                words = cute.recast_tensor(exceptions, cutlass.Uint32)
+                exception_packed = words[entry]
+                position = exception_packed & Uint32(0xFFFFFF)
+                exception_value = exception_packed >> Uint32(24)
+            exception_row = Int32(position // Uint32(self.columns))
+            exception_column = Int32(position % Uint32(self.columns))
+            exception_destination = Int64(expert) * Int64(
+                self.rows * self.columns
+            ) + Int64(self.output_offset(exception_row, exception_column))
+            if cutlass.const_expr(self.codec != 0):
+                exception_value = (exception_value << Uint32(3)) | (
+                    output[exception_destination].to(Uint32) & Uint32(7)
+                )
+            if cutlass.const_expr(self.layout == 1):
+                output[exception_destination] = lut[exception_value.to(Int64)]
+            else:
+                output[exception_destination] = exception_value.to(cutlass.Uint8)
+            entry += Int64(256)
+
+
+class _Pair:
+    def __init__(self, first, second, indexed=False):
+        plane = _Plane
+        if indexed:
+            from b12x._lib.quant.nvfp4_csf_indexed import IndexedNvfp4Plane
+
+            plane = IndexedNvfp4Plane
+        from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
+        from b12x._lib.quant.csf_blocks import (
+            CompactBlockStoragePlane,
+            Nvfp4BlockStoragePlane,
+        )
+
+        readers = {
+            2: PackedStoragePlane,
+            3: Nvfp4BlockStoragePlane,
+            4: CompactBlockStoragePlane,
+            5: CompactBlockStoragePlane,
+            6: CompactBlockStoragePlane,
+            7: CompactBlockStoragePlane,
+            8: CompactBlockStoragePlane,
+            9: CompactBlockStoragePlane,
+        }
+        self.first = readers.get(first[3], plane)(first)
+        self.second = readers.get(second[3], plane)(second)
+        self.threads = max(
+            getattr(self.first, "threads", 256), getattr(self.second, "threads", 256)
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        f13: cute.Pointer,
+        e13: cute.Pointer,
+        p13: cute.Pointer,
+        o13: cute.Pointer,
+        lut13: cute.Pointer,
+        f2: cute.Pointer,
+        e2: cute.Pointer,
+        p2: cute.Pointer,
+        o2: cute.Pointer,
+        lut2: cute.Pointer,
+        ids_ptr: cute.Pointer,
+        experts: Int32,
+        bytes13: Int64,
+        bytes2: Int64,
+        capacity: Int32,
+        mode: Int32,
+        barrier_count_ptr: cute.Pointer,
+        barrier_epoch_ptr: cute.Pointer,
+        barrier_slots: Int32,
+        stream: cuda.CUstream,
+    ):
+        first = self.first.tensors(f13, e13, p13, o13, lut13, experts, bytes13)
+        second = self.second.tensors(f2, e2, p2, o2, lut2, experts, bytes2)
+        ids = cute.make_tensor(ids_ptr, cute.make_layout((capacity,)))
+        barrier_count = cute.make_tensor(
+            barrier_count_ptr, cute.make_layout((barrier_slots,))
+        )
+        barrier_epoch = cute.make_tensor(
+            barrier_epoch_ptr, cute.make_layout((barrier_slots,))
+        )
+        self.kernel(
+            first,
+            second,
+            ids,
+            experts,
+            capacity,
+            mode,
+            barrier_count,
+            barrier_epoch,
+            barrier_slots,
+        ).launch(
+            grid=(capacity * Int32(self.first.tasks + self.second.tasks), 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        first,
+        second,
+        ids,
+        experts: Int32,
+        capacity: Int32,
+        mode: Int32,
+        barrier_count,
+        barrier_epoch,
+        barrier_slots: Int32,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        # The following MoE launch observes both resets through stream order.
+        # This folds its two fill launches into the scale expansion.
+        if block == 0:
+            slot_to_reset = Int32(tid)
+            while slot_to_reset < barrier_slots:
+                barrier_count[slot_to_reset] = Int32(0)
+                barrier_epoch[slot_to_reset] = Int32(0)
+                slot_to_reset += Int32(self.threads)
+        slot = Int32(block) // Int32(self.first.tasks + self.second.tasks)
+        task = Int32(block) % Int32(self.first.tasks + self.second.tasks)
+        expert = slot
+        # mode 0: potentially repeated routes; mode 1: unique IDs;
+        # mode 2: expert counts; mode 3: every expert, no route read.
+        if mode != Int32(3):
+            raw = ids[slot].to(Int64)
+            if mode == Int32(2):
+                if raw <= Int64(0):
+                    expert = Int32(-1)
+            else:
+                expert = Int32(-1)
+                if raw >= Int64(0) and raw < Int64(experts):
+                    expert = raw.to(Int32)
+                if mode == Int32(0):
+                    # Every warp checks the same prefix in parallel. The
+                    # resulting predicate is uniform across the CTA, so only
+                    # the first route may write an expert's scale region.
+                    duplicate = cutlass.Boolean(False)
+                    prior = Int32(tid) % Int32(32)
+                    while prior < slot:
+                        duplicate = duplicate | (ids[prior].to(Int64) == raw)
+                        prior += Int32(32)
+                    if cute.arch.vote_any_sync(duplicate):
+                        expert = Int32(-1)
+        if expert >= Int32(0) and expert < experts:
+            if task < Int32(self.first.tasks):
+                self.first.decode(first, expert, task, Int32(tid))
+            else:
+                self.second.decode(
+                    second, expert, task - Int32(self.first.tasks), Int32(tid)
+                )
+
+
+@program_cache
+def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
+    launch = _Pair(first, second, indexed)
+    key = (first, second, bool(ids64), bool(indexed))
+    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
+    plane = (
+        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Int64, 8, cute.AddressSpace.gmem, assumed_align=8),
+        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+    )
+    return b12x_compile(
+        launch,
+        *plane,
+        *plane,
+        make_ptr(
+            cutlass.Int64 if ids64 else cutlass.Int32,
+            8 if ids64 else 4,
+            cute.AddressSpace.gmem,
+            assumed_align=8 if ids64 else 4,
+        ),
+        1,
+        1,
+        1,
+        1,
+        0,
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        0,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 7, key),
+    )
+
+
+def _matches_scale_output(plane, output):
+    if plane.geometry[3] in range(4, 10):
+        return (
+            output.dtype
+            in (torch.uint8, torch.int32, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+            and output.ndim >= 1
+            and output.shape[0] == plane.num_experts
+            and output.numel() * output.element_size()
+            == plane.num_experts * plane.rows * plane.columns
+        )
+    expected = (
+        (plane.num_experts, plane.columns, plane.rows)
+        if plane.layout
+        else (plane.num_experts, plane.rows, plane.columns)
+    )
+    return (
+        output.dtype in (torch.uint8, torch.float8_e4m3fn)
+        and tuple(output.shape) == expected
+    )
+
+
+def decode_nvfp4_csf_pair(
+    first,
+    second,
+    ids,
+    out13,
+    out2,
+    *,
+    mode=0,
+    program=None,
+    barriers=None,
+    indexed_scales=None,
+):
+    """Launch the precompiled pair into caller-owned native NVFP4 scale grids."""
+    if first.num_experts != second.num_experts or mode not in (0, 1, 2, 3):
+        raise ValueError("NVFP4-CSF expert counts or routing mode disagree")
+    if (
+        ids.dtype not in (torch.int32, torch.int64)
+        or not ids.is_contiguous()
+        or ids.device != first.fixed.device
+    ):
+        raise ValueError("NVFP4-CSF routes must be contiguous CUDA int32/int64")
+    for batch, out in ((first, out13), (second, out2)):
+        if (
+            not _matches_scale_output(batch, out)
+            or not out.is_contiguous()
+            or out.device != batch.fixed.device
+        ):
+            raise ValueError("NVFP4-CSF output must match the native scale geometry")
+    if first.fixed.device != second.fixed.device:
+        raise ValueError("NVFP4-CSF projections must be on one CUDA device")
+    if (
+        out13.data_ptr() < out2.data_ptr() + out2.numel() * out2.element_size()
+        and out2.data_ptr() < out13.data_ptr() + out13.numel() * out13.element_size()
+    ):
+        raise ValueError("NVFP4-CSF output buffers must not overlap")
+    capacity = first.num_experts if mode == 3 else ids.numel()
+    if mode == 2 and capacity != first.num_experts:
+        raise ValueError("NVFP4-CSF count routing requires one count per expert")
+    if not capacity:
+        if barriers is not None:
+            raise ValueError("Fused barrier reset requires a nonempty decoder grid")
+        return
+    if barriers is not None and (
+        len(barriers) != 2
+        or barriers[0].numel() != barriers[1].numel()
+        or any(
+            t.dtype != torch.int32
+            or t.numel() == 0
+            or t.device != first.fixed.device
+            or not t.is_contiguous()
+            for t in barriers
+        )
+    ):
+        raise ValueError(
+            "Fused barrier reset requires two equally sized CUDA int32 arrays"
+        )
+    if program is None:
+        program = compile_nvfp4_csf_pair(
+            first.geometry,
+            second.geometry,
+            ids.dtype == torch.int64,
+            indexed_scales is not None,
+        )
+
+    sources = []
+    for index, batch in enumerate((first, second)):
+        sources.extend(
+            (
+                batch.fixed
+                if indexed_scales is None
+                else indexed_scales[index].storage,
+                batch.exceptions,
+                batch.task_offsets,
+                batch.fixed if batch.value_lut is None else batch.value_lut,
+            )
+        )
+    handle = id(program)
+    _LAUNCH_PROGRAMS[handle] = program
+    _decode_pair_op(
+        sources,
+        ids,
+        out13,
+        out2,
+        None if barriers is None else barriers[0],
+        None if barriers is None else barriers[1],
+        first.num_experts,
+        capacity,
+        mode,
+        handle,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::nvfp4_csf_pair",
+    mutates_args=("out13", "out2", "barrier_count", "barrier_epoch"),
+)
+def _decode_pair_op(
+    sources: list[torch.Tensor],
+    ids: torch.Tensor,
+    out13: torch.Tensor,
+    out2: torch.Tensor,
+    barrier_count: torch.Tensor | None,
+    barrier_epoch: torch.Tensor | None,
+    num_experts: int,
+    capacity: int,
+    routing_mode: int,
+    program_handle: int,
+) -> None:
+    program = _LAUNCH_PROGRAMS[program_handle]
+
+    def device_ptr(t, dtype, align):
+        return make_ptr(
+            dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+
+    args = []
+    for index, out in enumerate((out13, out2)):
+        fixed, exceptions, task_offsets, value_lut = sources[
+            index * 4 : (index + 1) * 4
+        ]
+        args.extend(
+            (
+                device_ptr(
+                    fixed,
+                    cutlass.Uint8,
+                    16,
+                ),
+                device_ptr(exceptions, cutlass.Uint8, 16),
+                device_ptr(task_offsets, cutlass.Int64, 8),
+                device_ptr(out, cutlass.Uint8, 16),
+                device_ptr(
+                    value_lut,
+                    cutlass.Uint8,
+                    16,
+                ),
+            )
+        )
+    program(
+        *args,
+        device_ptr(
+            ids,
+            cutlass.Int64 if ids.dtype == torch.int64 else cutlass.Int32,
+            8 if ids.dtype == torch.int64 else 4,
+        ),
+        num_experts,
+        sources[1].numel(),
+        sources[5].numel(),
+        capacity,
+        routing_mode,
+        device_ptr(
+            sources[2] if barrier_count is None else barrier_count, cutlass.Int32, 4
+        ),
+        device_ptr(
+            sources[2] if barrier_epoch is None else barrier_epoch, cutlass.Int32, 4
+        ),
+        0 if barrier_count is None else barrier_count.numel(),
+        current_cuda_stream(),
+    )
+
+
+@_decode_pair_op.register_fake
+def _decode_pair_fake(
+    sources,
+    ids,
+    out13,
+    out2,
+    barrier_count,
+    barrier_epoch,
+    num_experts,
+    capacity,
+    routing_mode,
+    program_handle,
+) -> None:
+    pass
+
+
+@dataclass(frozen=True)
+class Nvfp4CsfDecoder:
+    """Compressed expert planes and retained int32/int64 routing programs."""
+
+    first: Nvfp4CsfBatch
+    second: Nvfp4CsfBatch
+    programs: tuple
+    routing_programs: tuple
+    active: torch.Tensor
+    indexed_scales: tuple | None = None
+    indexed_programs: tuple | None = None
+    bitmap_routes: bool = False
+
+    @classmethod
+    def prepare(cls, first, second, out13, out2, *, indexed_scales=None):
+        from b12x._lib.quant.csf_routing import compile_csf_active_experts
+
+        for plane, output in ((first, out13), (second, out2)):
+            plane.validate()
+            if (
+                not _matches_scale_output(plane, output)
+                or output.device != plane.fixed.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError(
+                    "NVFP4-CSF scratch must match native E4M3 scale storage"
+                )
+        if first.num_experts != second.num_experts:
+            raise ValueError("NVFP4-CSF projections must have equal expert counts")
+        if first.fixed.device != second.fixed.device:
+            raise ValueError("NVFP4-CSF projections must be on one CUDA device")
+        if (
+            out13.data_ptr() < out2.data_ptr() + out2.numel() * out2.element_size()
+            and out2.data_ptr()
+            < out13.data_ptr() + out13.numel() * out13.element_size()
+        ):
+            raise ValueError("NVFP4-CSF output buffers must not overlap")
+        programs = tuple(
+            compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64)
+            for ids64 in (False, True)
+        )
+        return cls(
+            first,
+            second,
+            programs,
+            tuple(
+                compile_csf_active_experts(
+                    ids64, first.num_experts if first.geometry[3] in range(4, 10) else 0
+                )
+                for ids64 in (False, True)
+            ),
+            torch.empty(
+                first.num_experts, dtype=torch.int32, device=first.fixed.device
+            ),
+            indexed_scales=indexed_scales,
+            bitmap_routes=first.geometry[3] in range(4, 10),
+            indexed_programs=(
+                tuple(
+                    compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64, True)
+                    for ids64 in (False, True)
+                )
+                if indexed_scales is not None
+                else None
+            ),
+        )
+
+    def decode_all(self, out13, out2):
+        """Expand every expert on the current stream, as long prefills do."""
+        decode_nvfp4_csf_pair(
+            self.first,
+            self.second,
+            self.active,
+            out13,
+            out2,
+            mode=3,
+            program=self.programs[0],
+        )
+
+    def decode(self, ids, out13, out2, *, barriers=None):
+        from b12x._lib.quant.csf_routing import mark_active_experts
+
+        _maybe_dump(self, ids, out13, out2)
+        if os.environ.get("B12X_CSF_FAST_LOG") == "1":
+            import sys
+
+            print(f"[csf decode] ids={tuple(ids.shape)}/{str(ids.dtype)[6:]} out13={tuple(out13.shape)} "
+                  f"capturing={torch.cuda.is_current_stream_capturing()}", file=sys.stderr, flush=True)
+        if _fast_decode(self, ids, out13, out2, barriers):
+            return
+
+        # Build presence once for batch decode. Repeated token routes do not
+        # imply that every expert is active. Long prefills bound the scan work
+        # by expanding the complete, statically sized expert set instead.
+        mode = 0
+        if ids.numel() >= 16 * self.first.num_experts:
+            mode = 3
+        elif ids.numel() >= 64:
+            mark_active_experts(
+                ids, self.active, self.routing_programs[int(ids.dtype == torch.int64)]
+            )
+            ids, mode = self.active, 2
+        # Short route lists retain direct duplicate checks. Equal-size spans
+        # avoid assigning a large gate/up slab and a small down slab the same
+        # CTA budget. Presence and full-expert expansion retain their slab grid.
+        indexed = self.indexed_programs is not None and mode == 0
+        programs = self.indexed_programs if indexed else self.programs
+        decode_nvfp4_csf_pair(
+            self.first,
+            self.second,
+            ids,
+            out13,
+            out2,
+            mode=mode,
+            program=programs[int(ids.dtype == torch.int64)],
+            barriers=barriers,
+            indexed_scales=self.indexed_scales if indexed else None,
+        )
+
+
+_DUMPED = set()
+
+
+def _maybe_dump(decoder, ids, out13, out2):
+    """B12X_CSF_DUMP=<dir>: save the first few distinct decoders (one MoE layer each) on device 0."""
+    import os
+
+    path = os.environ.get("B12X_CSF_DUMP")
+    if not path or ids.device.index != 0 or torch.cuda.is_current_stream_capturing():
+        return
+    if id(decoder) in _DUMPED or len(_DUMPED) >= 2:
+        return
+    _DUMPED.add(id(decoder))
+    torch.cuda.synchronize()
+
+    import dataclasses
+
+    def plain(obj, depth=0):
+        if isinstance(obj, torch.Tensor):
+            return obj.cpu()
+        if isinstance(obj, (int, float, str, bool, type(None))):
+            return obj
+        if isinstance(obj, (tuple, list)):
+            return [plain(x, depth + 1) for x in obj]
+        if depth < 3 and dataclasses.is_dataclass(obj):
+            out = {"__class__": type(obj).__module__ + "." + type(obj).__qualname__}
+            for f in dataclasses.fields(obj):
+                out[f.name] = plain(getattr(obj, f.name), depth + 1)
+            for name in ("groups_per_task", "shared_exceptions", "geometry"):
+                if hasattr(obj, name) and name not in out:
+                    try:
+                        out[name] = plain(getattr(obj, name), depth + 1)
+                    except Exception as exc:
+                        out[name] = repr(exc)
+            return out
+        return repr(obj)
+
+    d = {"first": plain(decoder.first), "second": plain(decoder.second), "ids": ids.cpu(),
+         "out13_shape": tuple(out13.shape), "out13_dtype": str(out13.dtype),
+         "out2_shape": tuple(out2.shape), "out2_dtype": str(out2.dtype),
+         "indexed": plain(decoder.indexed_scales), "bitmap_routes": decoder.bitmap_routes,
+         "decoder_class": type(decoder).__module__ + "." + type(decoder).__qualname__}
+    os.makedirs(path, exist_ok=True)
+    torch.save(d, os.path.join(path, f"csf-{len(_DUMPED)}.pt"))
+
+
+_FAST = {}
+
+
+def _fast_decode(decoder, ids, out13, out2, barriers):
+    """B12X_CSF_FAST=1: persistent batched expansion (csf_fast) for routed decode shapes."""
+    import os
+
+    if os.environ.get("B12X_CSF_FAST", "0") != "1":
+        return False
+    if ids.dtype != torch.int32 or ids.numel() >= 16 * decoder.first.num_experts:
+        log_once(f"fast: skip dtype={ids.dtype} numel={ids.numel()} capturing={torch.cuda.is_current_stream_capturing()}")
+        return False
+    entry = fast_entry(decoder, ids.device)
+    if not entry:
+        log_once(f"fast: unsupported geometry {(decoder.first.geometry, decoder.second.geometry)}")
+        return False
+    program, grid, mod = entry
+    log_once(f"fast: launch numel={ids.numel()} defer_ok={DEFER_OK} fuse={os.environ.get('B12X_CSF_FUSE_PACK')} "
+             f"capturing={torch.cuda.is_current_stream_capturing()} barriers={barriers is not None}")
+    if DEFER_OK and os.environ.get("B12X_CSF_FUSE_PACK", "0") == "1":
+        global PENDING
+        if PENDING is not None:
+            flush_pending()
+        PENDING = (program, grid, mod, decoder.first, decoder.second, ids, out13, out2, barriers)
+        return True
+    mod.launch_fast_pair(program, decoder.first, decoder.second, ids, out13, out2, barriers, grid)
+    return True
+
+
+def fast_entry(decoder, device):
+    """(program, grid, module) of the persistent expansion for this decoder's planes, or False."""
+    import os
+
+    key = (decoder.first.geometry, decoder.second.geometry)
+    entry = _FAST.get(key)
+    if entry is None:
+        from b12x._lib.quant import csf_fast
+
+        entry = False
+        if csf_fast.supported(*key):
+            warps, batch, per_sm = (int(x) for x in os.environ.get("B12X_CSF_FAST_CFG", "8x2x6").split("x"))
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+            entry = (csf_fast.compile_fast_pair(*key, warps, batch), sms * per_sm, csf_fast)
+        _FAST[key] = entry
+    return entry
+
+
+# The W4A16 launcher sets DEFER_OK around the decode it immediately follows with route packing;
+# PENDING holds that expansion until flush_pending() launches it, fused with packing when given.
+DEFER_OK = False
+PENDING = None
+
+
+def flush_pending(pack=None):
+    global PENDING
+    if PENDING is None:
+        return False
+    program, grid, mod, first, second, ids, out13, out2, barriers = PENDING
+    PENDING = None
+    mod.launch_fast_pair(program, first, second, ids, out13, out2, barriers, grid, pack=pack)
+    return True
+
+
+_LOGGED = set()
+
+
+def log_once(message):
+    """B12X_CSF_FAST_LOG=1: one stderr line per distinct message (fast-path diagnostics)."""
+    import os, sys
+
+    if os.environ.get("B12X_CSF_FAST_LOG") != "1" or message in _LOGGED:
+        return
+    _LOGGED.add(message)
+    print("[csf_fast] " + message, file=sys.stderr, flush=True)
