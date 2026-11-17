@@ -15,7 +15,6 @@ median across rounds (C1: 5 rounds, C4/C8: 3 rounds).
 | Concurrency | Aggregate tok/s | Per-request tok/s | Median TTFT | MTP accepted / step |
 |---|---|---|---|---|
 | C1 | **188.8** | 192.9 | 180 ms | 1.64 (54.5%) |
-| C2 | not measured yet | | | |
 | C4 | **390.0** | 102.4 | 442 ms | 1.61 (53.6%) |
 | C8 | **546.8** | 72.7 | 499 ms | 1.58 (52.6%) |
 
@@ -24,7 +23,6 @@ median across rounds (C1: 5 rounds, C4/C8: 3 rounds).
 | Concurrency | Aggregate tok/s | Per-request tok/s | Median TTFT | MTP accepted / step |
 |---|---|---|---|---|
 | C1 | **170.7** | 174.0 | 175 ms | 1.59 (52.9%) |
-| C2 | not measured yet | | | |
 | C4 | **317.6** | 83.2 | 440 ms | 1.58 (52.5%) |
 | C8 | **435.6** | 57.4 | 529 ms | 1.57 (52.3%) |
 
