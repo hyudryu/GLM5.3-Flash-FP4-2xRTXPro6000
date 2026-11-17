@@ -1,7 +1,7 @@
 # GLM-5.3-Flash-FP4 on 2x RTX PRO 6000 — TP2 + DCP2, MTP3, b12x inline-CSF v5
 
 The vLLM deployment used on the 2x RTX PRO 6000 Blackwell Workstation workstation, captured from the
-running container (SparkDeck deployment *GLM-5.3-Flash-FP4 TP2 (b12x inline-CSF v5, RTX PRO 6000)*).
+running container (deployment *GLM-5.3-Flash-FP4 TP2 (b12x inline-CSF v5, RTX PRO 6000)*).
 
 ## Recipe
 
@@ -42,7 +42,7 @@ compute-bound and lose 20–27%.
 ## Speeds at 450 W per GPU
 
 Methodology identical to the 300 W section below. Raw outputs: [`results/450w-2026-10-31/`](results/450w-2026-10-31).
-A SparkDeck peer node sent two short probe requests (~16 generated tokens) during an earlier C4 attempt;
+Another client on the network sent two short probe requests (~16 generated tokens) during an earlier C4 attempt;
 that attempt was discarded and C4/C8 rerun with any round whose backend request count did not match
 re-executed (none needed). C1 completed before the probes.
 

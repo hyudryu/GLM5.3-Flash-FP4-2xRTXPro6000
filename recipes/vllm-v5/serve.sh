@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash-FP4 on 2x RTX PRO 6000 Blackwell: TP2 + DCP2, MTP3, b12x inline-CSF v5 overlay.
-# Reproduces the SparkDeck deployment "GLM-5.3-Flash-FP4 TP2 (b12x inline-CSF v5, RTX PRO 6000)" exactly as benchmarked.
+# Reproduces the deployment "GLM-5.3-Flash-FP4 TP2 (b12x inline-CSF v5, RTX PRO 6000)" exactly as benchmarked.
 # Requires iommu=pt (GPU P2P), image ghcr.io/local-inference-lab/vllm:release-10152026
 #   (sha256:745feb916ee816f5409fd58386114be4f22fbede7f9c0e0a7b8c4fe8dac0fb29).
 set -euo pipefail

@@ -2,7 +2,7 @@
 
 GLM-5.3-Flash (NVFP4) served with vLLM on 2x RTX PRO 6000 Blackwell Workstation: TP2 + DCP2, MTP with 3 draft
 tokens, and b12x kernels with inline compressed-scale-factor decode. The full recipe, launch script, overlay
-and raw results are in [`recipes/sparkdeck-v5/`](recipes/sparkdeck-v5).
+and raw results are in [`recipes/vllm-v5/`](recipes/vllm-v5).
 
 ## Decode speeds
 
@@ -39,4 +39,4 @@ concurrency.
 | C1 / C4 / C8 × 8K tokens (aggregate) | 11,483 / 11,446 / 11,427 | 8,448 / 8,464 / 8,450 |
 
 Per-length prefill results, round ranges and the reproduction commands are in the
-[recipe README](recipes/sparkdeck-v5/README.md).
+[recipe README](recipes/vllm-v5/README.md).
